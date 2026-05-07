@@ -106,6 +106,61 @@ describe('learnEngine', () => {
     expect(finalized.queue.some((entry) => entry.termId === sampleTerms[0].id && entry.mode === 'written')).toBe(true);
   });
 
+  it('can skip a written answer without marking it wrong', () => {
+    const progress = createInitialLearnProgress(smallTerms);
+    const session = {
+      ...createLearnSession(smallTerms, progress, settings),
+      stage: 'written' as const,
+      queue: [{ termId: smallTerms[0].id, mode: 'written' as const, dueStep: 0 }],
+      currentItem: { termId: smallTerms[0].id, mode: 'written' as const, stage: 'written' as const },
+      stageAnswered: 0,
+      stageCorrect: 0,
+    };
+
+    const updated = applyLearnWrittenAssessment(
+      progress,
+      session,
+      smallTerms[0].id,
+      compareAnswer('', smallTerms[0].answers),
+      { skipped: true },
+    );
+    const finalized = finalizeLearnStep(updated.session, updated.progress, smallTerms);
+
+    expect(updated.progress[smallTerms[0].id].writtenWrongCount).toBe(0);
+    expect(updated.progress[smallTerms[0].id].needsRetype).toBe(false);
+    expect(finalized.currentItem?.termId).not.toBe(smallTerms[0].id);
+  });
+
+  it('can override a wrong written answer as correct', () => {
+    const progress = createInitialLearnProgress(smallTerms);
+    const session = {
+      ...createLearnSession(smallTerms, progress, settings),
+      stage: 'written' as const,
+      queue: [{ termId: smallTerms[0].id, mode: 'written' as const, dueStep: 0 }],
+      currentItem: { termId: smallTerms[0].id, mode: 'written' as const, stage: 'written' as const },
+      stageAnswered: 0,
+      stageCorrect: 0,
+    };
+
+    const wrong = applyLearnWrittenAssessment(
+      progress,
+      session,
+      smallTerms[0].id,
+      compareAnswer('wrong answer', smallTerms[0].answers),
+    );
+    const override = applyLearnWrittenAssessment(
+      wrong.progress,
+      session,
+      smallTerms[0].id,
+      compareAnswer(smallTerms[0].answers[0], smallTerms[0].answers),
+      { overrideCorrect: true },
+    );
+
+    expect(override.progress[smallTerms[0].id].writtenCorrectCount).toBe(1);
+    expect(override.progress[smallTerms[0].id].writtenWrongCount).toBe(0);
+    expect(override.progress[smallTerms[0].id].needsRetype).toBe(false);
+  });
+
   it('keeps PC dual meanings as separate learn entries', () => {
     const progress = createInitialLearnProgress(terms);
     expect(progress['PC-personal']).toBeDefined();

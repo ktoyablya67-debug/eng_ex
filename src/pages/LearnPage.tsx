@@ -63,6 +63,11 @@ export function LearnPage() {
     title: string;
     lines: string[];
     tone: 'neutral' | 'success' | 'danger' | 'warm';
+    allowWrittenOverride?: boolean;
+  } | null>(null);
+  const [lastWrittenAttempt, setLastWrittenAttempt] = useState<{
+    termId: string;
+    session: LearnSessionState;
   } | null>(null);
 
   useEffect(() => {
@@ -176,10 +181,12 @@ export function LearnPage() {
 
   const handleWrittenSubmit = () => {
     if (!currentTerm || !session || !answer.trim()) return;
+    const attempt = { termId: currentTerm.id, session };
     const comparison = compareAnswer(answer, currentTerm.answers);
     const updated = applyLearnWrittenAssessment(learnProgress, session, currentTerm.id, comparison);
     markWritten(currentTerm.id, comparison, comparison.verdict !== 'correct');
     completeTransition(updated.progress, updated.session);
+    setLastWrittenAttempt(comparison.verdict === 'correct' ? null : attempt);
     setFeedback({
       title:
         comparison.verdict === 'correct'
@@ -194,6 +201,45 @@ export function LearnPage() {
       ],
       tone:
         comparison.verdict === 'correct' ? 'success' : comparison.verdict === 'almost' ? 'warm' : 'danger',
+      allowWrittenOverride: comparison.verdict !== 'correct',
+    });
+  };
+
+  const handleWrittenSkip = () => {
+    if (!currentTerm || !session) return;
+    const comparison = compareAnswer('', currentTerm.answers);
+    const updated = applyLearnWrittenAssessment(learnProgress, session, currentTerm.id, comparison, { skipped: true });
+    completeTransition(updated.progress, updated.session);
+    setLastWrittenAttempt(null);
+    setFeedback({
+      title: 'Пропущено',
+      lines: [
+        `Правильно: ${currentTerm.answers.join(' / ')}`,
+        `Подсказка: ${getMemoryHint(currentTerm)}`,
+      ],
+      tone: 'neutral',
+    });
+  };
+
+  const handleWrittenOverride = () => {
+    if (!lastWrittenAttempt) return;
+    const term = terms.find((item) => item.id === lastWrittenAttempt.termId);
+    if (!term) return;
+    const comparison = compareAnswer(term.answers[0], term.answers);
+    const updated = applyLearnWrittenAssessment(
+      learnProgress,
+      lastWrittenAttempt.session,
+      lastWrittenAttempt.termId,
+      comparison,
+      { overrideCorrect: true },
+    );
+    markWritten(lastWrittenAttempt.termId, comparison, false);
+    completeTransition(updated.progress, updated.session);
+    setLastWrittenAttempt(null);
+    setFeedback({
+      title: 'Засчитано как правильный ответ',
+      lines: [`Правильно: ${term.answers.join(' / ')}`],
+      tone: 'success',
     });
   };
 
@@ -563,6 +609,9 @@ export function LearnPage() {
         <button className="button" onClick={handleWrittenSubmit} type="button">
           Проверить ответ
         </button>
+        <button className="button button--ghost" onClick={handleWrittenSkip} type="button">
+          Пропустить
+        </button>
       </div>
     );
   };
@@ -612,6 +661,11 @@ export function LearnPage() {
               <button className="button" onClick={() => setFeedback(null)} type="button">
                 Дальше
               </button>
+              {feedback.allowWrittenOverride && (
+                <button className="button button--secondary" onClick={handleWrittenOverride} type="button">
+                  Я написал правильно
+                </button>
+              )}
             </section>
           ) : (
             <section className="trainer-card">{renderTask()}</section>

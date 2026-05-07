@@ -728,27 +728,32 @@ export const applyLearnWrittenAssessment = (
   session: LearnSessionState,
   termId: string,
   comparison: AnswerComparison,
+  options: { skipped?: boolean; overrideCorrect?: boolean } = {},
 ) => {
-  const correct = comparison.verdict === 'correct';
-  const almost = comparison.verdict === 'almost';
-  const delta = correct ? 25 : almost ? 10 : -25;
-  const needsRetype = !correct;
+  const skipped = options.skipped === true;
+  const overrideCorrect = options.overrideCorrect === true;
+  const correct = !skipped && comparison.verdict === 'correct';
+  const almost = !skipped && comparison.verdict === 'almost';
+  const delta = skipped ? 0 : overrideCorrect ? 50 : correct ? 25 : almost ? 10 : -25;
+  const needsRetype = skipped ? progress[termId].needsRetype : !correct;
 
   const nextProgress = updateProgress(progress, termId, (item) => ({
     ...item,
-    seenCount: item.seenCount + 1,
+    seenCount: skipped || overrideCorrect ? item.seenCount : item.seenCount + 1,
     writtenCorrectCount: item.writtenCorrectCount + (correct ? 1 : 0),
-    writtenWrongCount: item.writtenWrongCount + (correct ? 0 : 1),
+    writtenWrongCount: overrideCorrect
+      ? Math.max(0, item.writtenWrongCount - 1)
+      : item.writtenWrongCount + (!skipped && !correct ? 1 : 0),
     consecutiveCorrect: correct ? item.consecutiveCorrect + 1 : 0,
     confidence: item.confidence + delta,
     lastSeenAt: Date.now(),
-    lastWrongAt: correct ? item.lastWrongAt : Date.now(),
+    lastWrongAt: !skipped && !correct ? Date.now() : item.lastWrongAt,
     needsRetype,
   }));
 
   const consumedSession = consumeStep(session, termId, 'written', correct);
   const nextQueue =
-    needsRetype || comparison.verdict === 'almost'
+    !skipped && (needsRetype || comparison.verdict === 'almost')
       ? queueForRepeat(consumedSession.queue, termId, 'written', consumedSession.totalSteps, session.settings)
       : consumedSession.queue;
 
