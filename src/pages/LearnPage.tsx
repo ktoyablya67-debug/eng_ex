@@ -9,10 +9,12 @@ import {
   applyLearnWrittenAssessment,
   createInitialLearnProgress,
   createLearnSession,
+  deriveLearnProgressCounter,
   finalizeLearnStep,
   getLearnStageTitle,
   getLearnSummary,
   requestFinalCheck,
+  validateLearnSession,
 } from '../features/learn/learnEngine';
 import {
   loadLearnProgress,
@@ -44,10 +46,15 @@ export function LearnPage() {
     createInitialLearnProgress(terms, loadLearnProgress()),
   );
   const [settings, setSettings] = useState<LearnSettings>(() => loadLearnSettings() ?? defaultSettings);
-  const [session, setSession] = useState<LearnSessionState | null>(() => loadLearnSession());
-  const [resumePrompt, setResumePrompt] = useState(
-    () => Boolean(loadLearnSession() && loadLearnSession()?.stage !== 'session-complete'),
-  );
+  const [session, setSession] = useState<LearnSessionState | null>(() => {
+    const progress = createInitialLearnProgress(terms, loadLearnProgress());
+    return validateLearnSession(loadLearnSession(), terms, progress);
+  });
+  const [resumePrompt, setResumePrompt] = useState(() => {
+    const progress = createInitialLearnProgress(terms, loadLearnProgress());
+    const restored = validateLearnSession(loadLearnSession(), terms, progress);
+    return Boolean(restored && restored.stage !== 'session-complete');
+  });
   const [revealed, setRevealed] = useState(false);
   const [answer, setAnswer] = useState('');
   const [selectedChoice, setSelectedChoice] = useState<string | null>(null);
@@ -399,6 +406,7 @@ export function LearnPage() {
   const currentProgress = learnProgress[currentTerm.id];
   const prompt = getBlitzPrompt(currentTerm);
   const progressValue = session.introducedIds.length === 0 ? 0 : Math.round((summary.mastered / session.introducedIds.length) * 100);
+  const stageCounter = deriveLearnProgressCounter(session);
   const stageStepMap: Record<LearnStage, number> = {
     'intro-cards': 1,
     'recall-cards': 2,
@@ -586,7 +594,7 @@ export function LearnPage() {
               <div className="learn-progress-compact__row">
                 <span>Этап: {compactStageLabel}</span>
                 <span>
-                  {session.stageAnswered + 1}/{Math.max(session.currentBatchIds.length, 1)}
+                  {stageCounter.numerator}/{stageCounter.denominator}
                 </span>
               </div>
               <div className="learn-progress-compact__meta">

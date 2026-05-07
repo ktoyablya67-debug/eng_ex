@@ -16,6 +16,7 @@ import {
 export const INITIAL_BATCH_SIZE = 10;
 export const NEW_TERMS_PER_ROUND = 5;
 export const WEAK_TERMS_CARRY_OVER = 5;
+const MIXED_REVIEW_SIZE = 12;
 
 const CONFIDENCE_MIN = 0;
 const CONFIDENCE_MAX = 100;
@@ -25,6 +26,16 @@ const clamp = (value: number) => Math.max(CONFIDENCE_MIN, Math.min(CONFIDENCE_MA
 const shuffle = <T,>(items: T[]) => [...items].sort(() => Math.random() - 0.5);
 
 const dedupe = <T,>(items: T[]) => Array.from(new Set(items));
+
+const learnStages: LearnStage[] = [
+  'intro-cards',
+  'recall-cards',
+  'hard-blitz',
+  'written',
+  'mixed-review',
+  'final-check',
+  'session-complete',
+];
 
 export const createEmptyLearnTermProgress = (termId: string) => ({
   termId,
@@ -130,6 +141,101 @@ const getWeakestCarryOver = (ids: string[], progress: LearnProgressMap) =>
 const makeImmediateQueue = (termIds: string[], mode: LearnQuestionMode): LearnQueueEntry[] =>
   shuffle(termIds).map((termId) => ({ termId, mode, dueStep: 0 }));
 
+const makeMixedReviewQueue = (session: LearnSessionState, progress: LearnProgressMap): LearnQueueEntry[] => {
+  const weak = session.introducedIds.filter((id) => progress[id]?.status === 'weak' || progress[id]?.needsRetype);
+  const almost = session.introducedIds.filter((id) => {
+    const status = progress[id]?.status;
+    return status === 'almost' || status === 'learning';
+  });
+  const newIds = session.remainingNewIds.filter((id) => progress[id]?.status === 'new');
+  const source = dedupe([
+    ...weak.slice(0, 6),
+    ...almost.slice(0, 4),
+    ...newIds.slice(0, 2),
+    ...session.currentBatchIds,
+  ]).slice(0, MIXED_REVIEW_SIZE);
+  const modes: LearnQuestionMode[] = session.settings.cramMode
+    ? ['written', 'hard-blitz', 'written', 'recall-card']
+    : ['recall-card', 'hard-blitz', 'written'];
+
+  return source.map((termId, index) => ({
+    termId,
+    mode: modes[index % modes.length],
+    dueStep: 0,
+  }));
+};
+
+const makeFinalCheckQueue = (session: LearnSessionState, progress: LearnProgressMap): LearnQueueEntry[] => {
+  const weakest = [...session.introducedIds]
+    .filter((id) => progress[id])
+    .sort((left, right) => progress[left].confidence - progress[right].confidence)
+    .slice(0, 15);
+
+  return weakest.map((termId, index) => ({
+    termId,
+    mode: index < 10 ? 'hard-blitz' : 'written',
+    dueStep: 0,
+  }));
+};
+
+const makeQueueForStage = (
+  stage: LearnStage,
+  session: LearnSessionState,
+  progress: LearnProgressMap,
+): LearnQueueEntry[] => {
+  switch (stage) {
+    case 'intro-cards':
+      return makeImmediateQueue(session.currentBatchIds, 'intro-card');
+    case 'recall-cards':
+      return makeImmediateQueue(session.currentBatchIds, 'recall-card');
+    case 'hard-blitz':
+      return makeImmediateQueue(session.currentBatchIds, 'hard-blitz');
+    case 'written':
+      return makeImmediateQueue(
+        [...session.currentBatchIds].sort((left, right) => {
+          const leftItem = progress[left];
+          const rightItem = progress[right];
+          return Number(rightItem?.needsRetype) - Number(leftItem?.needsRetype);
+        }),
+        'written',
+      );
+    case 'mixed-review':
+      return makeMixedReviewQueue(session, progress);
+    case 'final-check':
+      return makeFinalCheckQueue(session, progress);
+    default:
+      return [];
+  }
+};
+
+function debugLearnTransition(message: string, session: LearnSessionState, next?: LearnSessionState) {
+  const isDev = (import.meta as ImportMeta & { env?: { DEV?: boolean } }).env?.DEV;
+  if (isDev) {
+    console.warn('[learn-engine]', message, {
+      stage: session.stage,
+      answered: session.stageAnswered,
+      queueLength: session.queue.length,
+      currentItem: session.currentItem?.termId ?? null,
+      nextStage: next?.stage,
+      nextQueueLength: next?.queue.length,
+    });
+  }
+}
+
+function repairEmptyQueue(
+  session: LearnSessionState,
+  progress: LearnProgressMap,
+  terms: Term[],
+): LearnSessionState {
+  if (session.stage === 'session-complete' || session.currentItem || session.queue.length > 0) {
+    return session;
+  }
+
+  const repaired = forceAdvanceStage(session, progress, terms, 'empty queue repair');
+  debugLearnTransition('empty queue repaired', session, repaired);
+  return repaired;
+}
+
 const withCurrentItem = (
   session: LearnSessionState,
   progress: LearnProgressMap,
@@ -142,28 +248,18 @@ const withCurrentItem = (
     };
   }
 
-  const nextItem = getNextLearnItem(progress, terms, session);
+  const repaired = repairEmptyQueue(session, progress, terms);
+  const nextItem = getNextLearnItem(progress, terms, repaired);
   if (!nextItem) {
     return {
-      ...session,
+      ...repaired,
       stage: 'session-complete',
       currentItem: null,
     };
   }
 
-  const queueIndex = session.queue.findIndex(
-    (entry) =>
-      entry.termId === nextItem.termId &&
-      entry.mode === nextItem.mode &&
-      entry.dueStep <= session.totalSteps,
-  );
-  const nextQueue = queueIndex >= 0
-    ? session.queue.filter((_, index) => index !== queueIndex)
-    : session.queue;
-
   return {
-    ...session,
-    queue: nextQueue,
+    ...repaired,
     currentItem: nextItem,
     lastTermId: nextItem.termId,
   };
@@ -203,6 +299,60 @@ export const createLearnSession = (
   return withCurrentItem(createBaseSession(currentBatchIds, remainingNewIds, settings), progress, terms);
 };
 
+export const validateLearnSession = (
+  session: LearnSessionState | null,
+  terms: Term[],
+  progress: LearnProgressMap,
+): LearnSessionState | null => {
+  if (!session || !learnStages.includes(session.stage)) {
+    return null;
+  }
+
+  const termIds = new Set(terms.map((term) => term.id));
+  const currentBatchIds = session.currentBatchIds.filter((id) => termIds.has(id));
+  const introducedIds = session.introducedIds.filter((id) => termIds.has(id));
+  const remainingNewIds = session.remainingNewIds.filter((id) => termIds.has(id));
+  const queue = session.queue.filter((entry) => termIds.has(entry.termId));
+
+  if (session.stage !== 'session-complete' && currentBatchIds.length === 0 && introducedIds.length === 0) {
+    return null;
+  }
+
+  const sanitized: LearnSessionState = {
+    ...session,
+    currentBatchIds,
+    introducedIds: introducedIds.length > 0 ? introducedIds : currentBatchIds,
+    remainingNewIds,
+    queue,
+    stageAnswered: Math.max(0, session.stageAnswered),
+    stageCorrect: Math.max(0, Math.min(session.stageCorrect, Math.max(0, session.stageAnswered))),
+    currentItem: session.currentItem && termIds.has(session.currentItem.termId) ? session.currentItem : null,
+  };
+
+  const repaired = repairEmptyQueue(
+    {
+      ...sanitized,
+      currentItem: sanitized.queue.some(
+        (entry) => entry.termId === sanitized.currentItem?.termId && entry.mode === sanitized.currentItem?.mode,
+      )
+        ? sanitized.currentItem
+        : null,
+    },
+    progress,
+    terms,
+  );
+
+  return withCurrentItem(repaired, progress, terms);
+};
+
+export const deriveLearnProgressCounter = (session: LearnSessionState) => {
+  const denominator = Math.max(session.stageAnswered + session.queue.length + (session.currentItem ? 0 : 0), 1);
+  const numerator = session.stage === 'session-complete'
+    ? denominator
+    : Math.min(session.stageAnswered + 1, denominator);
+  return { numerator, denominator };
+};
+
 export const getLearnWeight = (
   item: LearnProgressMap[string],
   session: LearnSessionState,
@@ -235,16 +385,6 @@ const pickWeightedTermId = (
   return weightedPool[Math.floor(Math.random() * weightedPool.length)];
 };
 
-const pickMixedMode = (session: LearnSessionState): LearnQuestionMode => {
-  const recent = session.recentModes.slice(-2);
-  const preferred: LearnQuestionMode[] = session.settings.cramMode
-    ? ['written', 'hard-blitz', 'written', 'recall-card', 'written', 'hard-blitz']
-    : ['recall-card', 'hard-blitz', 'written', 'hard-blitz', 'recall-card'];
-
-  const candidate = preferred.find((mode) => !(recent.length === 2 && recent.every((item) => item === mode)));
-  return candidate ?? 'written';
-};
-
 export const getNextLearnItem = (
   progress: LearnProgressMap,
   terms: Term[],
@@ -266,88 +406,40 @@ export const getNextLearnItem = (
     };
   }
 
-  let mode: LearnQuestionMode = 'recall-card';
-  let candidateIds = [...session.currentBatchIds];
-
-  if (session.stage === 'intro-cards') {
-    return null;
-  }
-
-  if (session.stage === 'recall-cards') {
-    mode = 'recall-card';
-  } else if (session.stage === 'hard-blitz') {
-    mode = 'hard-blitz';
-  } else if (session.stage === 'written') {
-    mode = 'written';
-    candidateIds = [...session.currentBatchIds].sort((left, right) => {
-      const leftItem = progress[left];
-      const rightItem = progress[right];
-      return Number(rightItem.needsRetype) - Number(leftItem.needsRetype);
-    });
-  } else if (session.stage === 'mixed-review') {
-    mode = pickMixedMode(session);
-    const weak = session.introducedIds.filter((id) => progress[id].status === 'weak' || progress[id].needsRetype);
-    const almost = session.introducedIds.filter((id) => {
-      const state = progress[id].status;
-      return state === 'almost' || state === 'learning';
-    });
-    const newIds = session.remainingNewIds.filter((id) => progress[id].status === 'new');
-    candidateIds = dedupe([
-      ...weak.slice(0, Math.max(1, Math.ceil(weak.length * 0.5))),
-      ...almost.slice(0, Math.max(1, Math.ceil(almost.length * 0.3))),
-      ...newIds.slice(0, Math.max(1, Math.ceil(newIds.length * 0.2))),
-      ...session.currentBatchIds,
-    ]);
-  } else if (session.stage === 'final-check') {
-    const weakest = [...session.introducedIds]
-      .sort((left, right) => progress[left].confidence - progress[right].confidence)
-      .slice(0, 15);
-    candidateIds = weakest;
-    mode = session.stageAnswered < Math.min(weakest.length, 10) ? 'hard-blitz' : 'written';
-  }
-
-  if (candidateIds.length === 0) {
-    return null;
-  }
-
-  return {
-    termId: pickWeightedTermId(candidateIds, progress, session, mode),
-    mode,
-    stage: session.stage,
-  };
+  return null;
 };
 
 const queueForRepeat = (
   queue: LearnQueueEntry[],
   termId: string,
   mode: LearnQuestionMode,
-  currentStep: number,
-  settings: LearnSettings,
+  _currentStep: number,
+  _settings: LearnSettings,
 ) => [
   ...queue,
   {
     termId,
     mode,
-    dueStep: currentStep + getDueOffset(settings.pace, settings.cramMode),
+    dueStep: 0,
   },
 ];
 
 const shouldAdvanceRecall = (session: LearnSessionState, progress: LearnProgressMap) => {
   const confident = session.currentBatchIds.filter((id) => progress[id].confidence >= 35).length;
-  return session.stageAnswered >= session.currentBatchIds.length && confident / session.currentBatchIds.length >= 0.7;
+  return session.queue.length === 0 && (confident / session.currentBatchIds.length >= 0.7 || session.stageAnswered > 0);
 };
 
 const shouldAdvanceBlitz = (session: LearnSessionState) =>
-  session.stageAnswered >= Math.max(session.currentBatchIds.length, 6) &&
-  session.stageCorrect / Math.max(session.stageAnswered, 1) >= 0.7;
+  session.queue.length === 0 && session.stageAnswered > 0;
 
 const shouldAdvanceWritten = (session: LearnSessionState, progress: LearnProgressMap) =>
-  session.stageAnswered >= session.currentBatchIds.length &&
-  session.currentBatchIds.every((id) => progress[id].writtenCorrectCount >= 1);
+  session.queue.length === 0 &&
+  session.stageAnswered > 0 &&
+  session.currentBatchIds.every((id) => progress[id].writtenCorrectCount >= 1 || !session.introducedIds.includes(id));
 
 const shouldAddNewTerms = (session: LearnSessionState, progress: LearnProgressMap) => {
   const confident = session.currentBatchIds.filter((id) => progress[id].confidence >= 70).length;
-  return confident / session.currentBatchIds.length >= 0.7;
+  return session.queue.length === 0 && confident / session.currentBatchIds.length >= 0.7;
 };
 
 const createNextBatch = (
@@ -372,84 +464,175 @@ const maybeAdvanceStage = (
   progress: LearnProgressMap,
 ): LearnSessionState => {
   if (session.finalCheckRequested && session.stage !== 'final-check' && session.stage !== 'session-complete') {
-    return {
+    const next: LearnSessionState = {
       ...session,
       stage: 'final-check',
       stageAnswered: 0,
       stageCorrect: 0,
-      queue: [],
+      queue: makeQueueForStage('final-check', session, progress),
+      currentItem: null,
     };
+    debugLearnTransition('final check requested', session, next);
+    return next;
   }
 
-  if (session.stage === 'intro-cards' && session.stageAnswered >= session.currentBatchIds.length) {
-    return {
+  if (session.stage === 'intro-cards' && session.queue.length === 0) {
+    const next: LearnSessionState = {
       ...session,
       stage: 'recall-cards',
       stageAnswered: 0,
       stageCorrect: 0,
-      queue: makeImmediateQueue(session.currentBatchIds, 'recall-card'),
+      queue: makeQueueForStage('recall-cards', session, progress),
+      currentItem: null,
     };
+    debugLearnTransition('intro complete', session, next);
+    return next;
   }
 
-  if (session.stage === 'recall-cards' && shouldAdvanceRecall(session, progress)) {
-    return {
+  if (session.stage === 'recall-cards' && (shouldAdvanceRecall(session, progress) || session.queue.length === 0)) {
+    const next: LearnSessionState = {
       ...session,
       stage: 'hard-blitz',
       stageAnswered: 0,
       stageCorrect: 0,
-      queue: [],
+      queue: makeQueueForStage('hard-blitz', session, progress),
+      currentItem: null,
     };
+    debugLearnTransition('recall complete', session, next);
+    return next;
   }
 
   if (session.stage === 'hard-blitz' && shouldAdvanceBlitz(session)) {
-    return {
+    const next: LearnSessionState = {
       ...session,
       stage: 'written',
       stageAnswered: 0,
       stageCorrect: 0,
-      queue: [],
+      queue: makeQueueForStage('written', session, progress),
+      currentItem: null,
     };
+    debugLearnTransition('hard blitz complete', session, next);
+    return next;
   }
 
   if (session.stage === 'written' && shouldAdvanceWritten(session, progress)) {
-    return {
+    const next: LearnSessionState = {
       ...session,
       stage: 'mixed-review',
       stageAnswered: 0,
       stageCorrect: 0,
-      queue: [],
+      queue: makeQueueForStage('mixed-review', session, progress),
+      currentItem: null,
     };
+    debugLearnTransition('written complete', session, next);
+    return next;
   }
 
   if (session.stage === 'mixed-review' && shouldAddNewTerms(session, progress)) {
     if (session.remainingNewIds.length > 0) {
-      return {
+      const nextBatch = createNextBatch(session, progress);
+      const next: LearnSessionState = {
         ...session,
-        ...createNextBatch(session, progress),
+        ...nextBatch,
         stage: 'intro-cards',
         stageAnswered: 0,
         stageCorrect: 0,
+        currentItem: null,
       };
+      debugLearnTransition('mixed review complete, next batch', session, next);
+      return next;
     }
 
-    return {
+    const next: LearnSessionState = {
       ...session,
       stage: 'final-check',
       stageAnswered: 0,
       stageCorrect: 0,
-      queue: [],
+      queue: makeQueueForStage('final-check', session, progress),
+      currentItem: null,
     };
+    debugLearnTransition('mixed review complete, final check', session, next);
+    return next;
   }
 
-  if (session.stage === 'final-check' && session.stageAnswered >= Math.min(session.introducedIds.length, 15)) {
-    return {
+  if (session.stage === 'mixed-review' && session.queue.length === 0 && session.remainingNewIds.length > 0) {
+    const nextBatch = createNextBatch(session, progress);
+    const next: LearnSessionState = {
+      ...session,
+      ...nextBatch,
+      stage: 'intro-cards' as LearnStage,
+      stageAnswered: 0,
+      stageCorrect: 0,
+      currentItem: null,
+    };
+    debugLearnTransition('mixed review exhausted, next batch', session, next);
+    return next;
+  }
+
+  if (session.stage === 'mixed-review' && session.queue.length === 0) {
+    const next: LearnSessionState = {
+      ...session,
+      stage: 'final-check',
+      stageAnswered: 0,
+      stageCorrect: 0,
+      queue: makeQueueForStage('final-check', session, progress),
+      currentItem: null,
+    };
+    debugLearnTransition('mixed review exhausted', session, next);
+    return next;
+  }
+
+  if (session.stage === 'final-check' && session.queue.length === 0) {
+    const next: LearnSessionState = {
       ...session,
       stage: 'session-complete',
       currentItem: null,
     };
+    debugLearnTransition('session complete', session, next);
+    return next;
   }
 
   return session;
+};
+
+function forceAdvanceStage(
+  session: LearnSessionState,
+  progress: LearnProgressMap,
+  terms: Term[],
+  reason: string,
+): LearnSessionState {
+  const forcedSession = {
+    ...session,
+    queue: [],
+    currentItem: null,
+  };
+  const advanced = maybeAdvanceStage(forcedSession, progress);
+
+  if (advanced !== forcedSession && advanced.queue.length > 0) {
+    return advanced;
+  }
+
+  if (session.stage !== 'session-complete') {
+    const rebuiltQueue = makeQueueForStage(session.stage, session, progress).filter((entry) =>
+      terms.some((term) => term.id === entry.termId),
+    );
+    if (rebuiltQueue.length > 0) {
+      const next: LearnSessionState = {
+        ...session,
+        queue: rebuiltQueue,
+        currentItem: null,
+      };
+      debugLearnTransition(reason, session, next);
+      return next;
+    }
+  }
+
+  return advanced;
+}
+
+const removeAnsweredEntry = (queue: LearnQueueEntry[], termId: string, mode: LearnQuestionMode) => {
+  const index = queue.findIndex((entry) => entry.termId === termId && entry.mode === mode);
+  return index >= 0 ? queue.filter((_, itemIndex) => itemIndex !== index) : queue;
 };
 
 const consumeStep = (session: LearnSessionState, termId: string, mode: LearnQuestionMode, correct: boolean) => ({
@@ -457,8 +640,10 @@ const consumeStep = (session: LearnSessionState, termId: string, mode: LearnQues
   totalSteps: session.totalSteps + 1,
   stageAnswered: session.stageAnswered + 1,
   stageCorrect: session.stageCorrect + (correct ? 1 : 0),
+  queue: removeAnsweredEntry(session.queue, termId, mode),
   recentModes: [...session.recentModes.slice(-3), mode],
   lastTermId: termId,
+  currentItem: null,
 });
 
 export const applyLearnCardAssessment = (
@@ -482,15 +667,15 @@ export const applyLearnCardAssessment = (
     lastWrongAt: isStrong ? item.lastWrongAt : Date.now(),
   }));
 
-  const nextMode = session.stage === 'intro-cards' ? 'recall-card' : 'recall-card';
+  const consumedSession = consumeStep(session, termId, session.currentItem?.mode ?? 'recall-card', isStrong);
   const nextQueue =
     isStrong
-      ? session.queue
-      : queueForRepeat(session.queue, termId, nextMode, session.totalSteps, session.settings);
+      ? consumedSession.queue
+      : queueForRepeat(consumedSession.queue, termId, 'recall-card', consumedSession.totalSteps, session.settings);
 
   const updatedSession = maybeAdvanceStage(
     {
-      ...consumeStep(session, termId, session.currentItem?.mode ?? 'recall-card', isStrong),
+      ...consumedSession,
       queue: nextQueue,
     },
     nextProgress,
@@ -519,13 +704,14 @@ export const applyLearnBlitzAssessment = (
     lastWrongAt: correct ? item.lastWrongAt : Date.now(),
   }));
 
+  const consumedSession = consumeStep(session, termId, 'hard-blitz', correct);
   const nextQueue = correct
-    ? session.queue
-    : queueForRepeat(session.queue, termId, 'hard-blitz', session.totalSteps, session.settings);
+    ? consumedSession.queue
+    : queueForRepeat(consumedSession.queue, termId, 'hard-blitz', consumedSession.totalSteps, session.settings);
 
   const updatedSession = maybeAdvanceStage(
     {
-      ...consumeStep(session, termId, 'hard-blitz', correct),
+      ...consumedSession,
       queue: nextQueue,
     },
     nextProgress,
@@ -560,14 +746,15 @@ export const applyLearnWrittenAssessment = (
     needsRetype,
   }));
 
+  const consumedSession = consumeStep(session, termId, 'written', correct);
   const nextQueue =
     needsRetype || comparison.verdict === 'almost'
-      ? queueForRepeat(session.queue, termId, 'written', session.totalSteps, session.settings)
-      : session.queue;
+      ? queueForRepeat(consumedSession.queue, termId, 'written', consumedSession.totalSteps, session.settings)
+      : consumedSession.queue;
 
   const updatedSession = maybeAdvanceStage(
     {
-      ...consumeStep(session, termId, 'written', correct),
+      ...consumedSession,
       queue: nextQueue,
     },
     nextProgress,
