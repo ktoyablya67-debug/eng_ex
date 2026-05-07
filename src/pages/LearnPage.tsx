@@ -23,7 +23,7 @@ import {
   saveLearnSession,
   saveLearnSettings,
 } from '../features/learn/learnStorage';
-import { compareAnswer } from '../utils/answerCheck';
+import { compareAnswer, normalizeAnswer } from '../utils/answerCheck';
 import { generateDistractors, getBlitzAnswer, getBlitzPrompt } from '../utils/generateDistractors';
 import { getMemoryHint } from '../utils/memoryHints';
 import { LearnQuestionMode, LearnSessionState, LearnSettings, LearnStage, Term } from '../types';
@@ -148,7 +148,9 @@ export function LearnPage() {
   const handleBlitzAnswer = (choice: string) => {
     if (!currentTerm || !session) return;
     setSelectedChoice(choice);
-    const correct = choice === getBlitzAnswer(currentTerm);
+    const acceptedAnswers = Array.from(new Set([getBlitzAnswer(currentTerm), ...currentTerm.answers]));
+    const normalizedChoice = normalizeAnswer(choice);
+    const correct = acceptedAnswers.some((acceptedAnswer) => normalizeAnswer(acceptedAnswer) === normalizedChoice);
     const updated = applyLearnBlitzAssessment(learnProgress, session, currentTerm.id, correct);
     markBlitz(currentTerm.id, correct);
     completeTransition(updated.progress, updated.session);
@@ -513,16 +515,23 @@ export function LearnPage() {
           {prompt.context && <div className="dual-term-badge">{prompt.context}</div>}
           <p className="learn-task-card__subtle">Выбери точную расшифровку среди похожих вариантов.</p>
           <div className="choice-grid choice-grid--single">
-            {blitzChoices.map((choice) => (
-              <button
-                key={choice}
-                className={`choice-card ${selectedChoice === choice ? 'choice-card--wrong' : ''}`}
-                onClick={() => handleBlitzAnswer(choice)}
-                type="button"
-              >
-                {choice}
-              </button>
-            ))}
+            {blitzChoices.map((choice) => {
+              const isSelected = selectedChoice === choice;
+              const isCorrectChoice = normalizeAnswer(choice) === normalizeAnswer(getBlitzAnswer(currentTerm));
+
+              return (
+                <button
+                  key={choice}
+                  className={`choice-card ${
+                    isSelected ? (isCorrectChoice ? 'choice-card--correct' : 'choice-card--wrong') : ''
+                  }`}
+                  onClick={() => handleBlitzAnswer(choice)}
+                  type="button"
+                >
+                  {choice}
+                </button>
+              );
+            })}
           </div>
         </div>
       );
